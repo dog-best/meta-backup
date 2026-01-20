@@ -1,0 +1,9 @@
+[
+  {
+    "table_name": "profiles",
+    "trigger_name": "profiles_public_uid_trigger",
+    "action_timing": "BEFORE",
+    "event_manipulation": "INSERT",
+    "action_statement": "EXECUTE FUNCTION assign_unique_public_uid()"
+  }
+]
