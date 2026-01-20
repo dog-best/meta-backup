@@ -1,5 +1,5 @@
-import { serve } from "https://deno.land/std/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 
 type DvaRow = {
   user_id: string;
@@ -14,44 +14,73 @@ type DvaRow = {
   raw: any;
 };
 
+function json(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function pickAccount(row: any) {
+  return {
+    account_number: row.account_number,
+    bank_name: row.bank_name,
+    account_name: row.account_name,
+    currency: row.currency ?? "NGN",
+    active: !!row.active,
+  };
+}
+
 serve(async (req) => {
   try {
     if (req.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
+      return json(405, { success: false, message: "Method not allowed" });
+    }
+
+    const SB_URL = Deno.env.get("SB_URL");
+    const SB_ANON = Deno.env.get("SB_ANON_KEY");
+    const SB_SERVICE = Deno.env.get("SB_SERVICE_ROLE_KEY");
+    const PAYSTACK_SECRET = Deno.env.get("PAYSTACK_SECRET_KEY");
+
+    if (!SB_URL || !SB_ANON || !SB_SERVICE || !PAYSTACK_SECRET) {
+      return json(500, {
+        success: false,
+        message: "Missing env vars",
+        hasSB_URL: !!SB_URL,
+        hasSB_ANON_KEY: !!SB_ANON,
+        hasSB_SERVICE_ROLE_KEY: !!SB_SERVICE,
+        hasPAYSTACK_SECRET_KEY: !!PAYSTACK_SECRET,
+      });
     }
 
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader) return new Response("Unauthorized", { status: 401 });
+    if (!authHeader) return json(401, { success: false, message: "Unauthorized (missing auth header)" });
 
     // user-scoped client (auth only)
-    const userClient = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_ANON_KEY")!,
-      { global: { headers: { Authorization: authHeader } } }
-    );
+    const userClient = createClient(SB_URL, SB_ANON, {
+      global: { headers: { Authorization: authHeader } },
+    });
 
     const { data: auth, error: authError } = await userClient.auth.getUser();
     const user = auth?.user;
-    if (!user || authError) return new Response("Unauthorized", { status: 401 });
+    if (!user || authError) return json(401, { success: false, message: "Unauthorized (invalid token)" });
 
     // admin client (db writes)
-    const admin = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    const admin = createClient(SB_URL, SB_SERVICE);
 
     // 1) return existing DVA (active)
-    const { data: existing } = await admin
+    const { data: existing, error: existingErr } = await admin
       .from("user_virtual_accounts")
       .select(
-        "user_id,paystack_customer_code,paystack_dedicated_account_id,account_number,bank_name,account_name,currency,provider_slug,active"
+        "user_id,paystack_customer_code,paystack_dedicated_account_id,account_number,bank_name,account_name,currency,provider_slug,active",
       )
       .eq("user_id", user.id)
       .eq("active", true)
       .maybeSingle<DvaRow>();
 
+    if (existingErr) return json(500, { success: false, message: existingErr.message });
     if (existing?.account_number) {
-      return json200({ success: true, account: pickAccount(existing) });
+      return json(200, { success: true, account: pickAccount(existing) });
     }
 
     // 2) get profile
@@ -61,14 +90,13 @@ serve(async (req) => {
       .eq("id", user.id)
       .single();
 
-    if (profileErr || !profile?.email) {
-      return json400("User profile missing email");
-    }
+    if (profileErr) return json(500, { success: false, message: profileErr.message });
+    if (!profile?.email) return json(400, { success: false, message: "User profile missing email" });
 
-    // 3) If we have a previous customer_code (inactive record maybe), reuse it
+    // 3) reuse customer code if exists
     let customerCode: string | null = null;
 
-    const { data: prev } = await admin
+    const { data: prev, error: prevErr } = await admin
       .from("user_virtual_accounts")
       .select("paystack_customer_code")
       .eq("user_id", user.id)
@@ -77,6 +105,7 @@ serve(async (req) => {
       .limit(1)
       .maybeSingle<{ paystack_customer_code: string | null }>();
 
+    if (prevErr) return json(500, { success: false, message: prevErr.message });
     if (prev?.paystack_customer_code) customerCode = prev.paystack_customer_code;
 
     // 4) Create Paystack customer if needed
@@ -84,7 +113,7 @@ serve(async (req) => {
       const customerRes = await fetch("https://api.paystack.co/customer", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${Deno.env.get("PAYSTACK_SECRET_KEY")}`,
+          Authorization: `Bearer ${PAYSTACK_SECRET}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -96,7 +125,7 @@ serve(async (req) => {
 
       const customerJson = await customerRes.json();
       if (!customerRes.ok || !customerJson?.status) {
-        return json502("Paystack customer create failed", customerJson);
+        return json(502, { success: false, message: "Paystack customer create failed", raw: customerJson });
       }
 
       customerCode = customerJson.data.customer_code;
@@ -106,18 +135,15 @@ serve(async (req) => {
     const dvaRes = await fetch("https://api.paystack.co/dedicated_account", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${Deno.env.get("PAYSTACK_SECRET_KEY")}`,
+        Authorization: `Bearer ${PAYSTACK_SECRET}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        customer: customerCode,
-        // optional: preferred_bank: "wema-bank"
-      }),
+      body: JSON.stringify({ customer: customerCode }),
     });
 
     const dvaJson = await dvaRes.json();
     if (!dvaRes.ok || !dvaJson?.status) {
-      return json502("Paystack DVA create failed", dvaJson);
+      return json(502, { success: false, message: "Paystack DVA create failed", raw: dvaJson });
     }
 
     const accountNumber = dvaJson.data.account_number;
@@ -138,58 +164,14 @@ serve(async (req) => {
       raw: dvaJson.data,
     });
 
-    if (insErr) {
-      return json502("Failed to store virtual account", insErr);
-    }
+    if (insErr) return json(500, { success: false, message: insErr.message });
 
-    return json200({
+    return json(200, {
       success: true,
-      account: {
-        account_number: accountNumber,
-        bank_name: bankName,
-        account_name: accountName,
-        currency: "NGN",
-        active: true,
-      },
+      account: { account_number: accountNumber, bank_name: bankName, account_name: accountName, currency: "NGN", active: true },
     });
   } catch (e) {
     console.error("paystack-dva error:", e);
-    return json500("Server error");
+    return json(500, { success: false, message: "Server error" });
   }
 });
-
-function pickAccount(row: any) {
-  return {
-    account_number: row.account_number,
-    bank_name: row.bank_name,
-    account_name: row.account_name,
-    currency: row.currency ?? "NGN",
-    active: !!row.active,
-  };
-}
-
-function json200(obj: any) {
-  return new Response(JSON.stringify(obj), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-function json400(message: string) {
-  return new Response(JSON.stringify({ success: false, message }), {
-    status: 400,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-function json500(message: string) {
-  return new Response(JSON.stringify({ success: false, message }), {
-    status: 500,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-function json502(message: string, raw: any) {
-  return new Response(JSON.stringify({ success: false, message, raw }), {
-    status: 502,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-

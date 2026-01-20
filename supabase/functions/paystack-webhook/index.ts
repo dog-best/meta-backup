@@ -16,7 +16,7 @@ async function verifyPaystackSignature(rawBody: string, signature: string, secre
     encoder.encode(secret),
     { name: "HMAC", hash: "SHA-512" },
     false,
-    ["sign"]
+    ["sign"],
   );
 
   const signatureBuffer = await crypto.subtle.sign("HMAC", key, encoder.encode(rawBody));
@@ -29,15 +29,26 @@ async function verifyPaystackSignature(rawBody: string, signature: string, secre
 
 serve(async (req) => {
   try {
+    const SB_URL = Deno.env.get("SB_URL");
+    const SB_SERVICE = Deno.env.get("SB_SERVICE_ROLE_KEY");
+    const PAYSTACK_SECRET = Deno.env.get("PAYSTACK_SECRET_KEY");
+
+    if (!SB_URL || !SB_SERVICE || !PAYSTACK_SECRET) {
+      return json(500, {
+        ok: false,
+        message: "Missing env vars",
+        hasSB_URL: !!SB_URL,
+        hasSB_SERVICE_ROLE_KEY: !!SB_SERVICE,
+        hasPAYSTACK_SECRET_KEY: !!PAYSTACK_SECRET,
+      });
+    }
+
     const signature = req.headers.get("x-paystack-signature");
     if (!signature) return json(400, { ok: false, message: "Missing signature" });
 
-    const secret = Deno.env.get("PAYSTACK_SECRET_KEY");
-    if (!secret) return json(500, { ok: false, message: "PAYSTACK_SECRET_KEY not set" });
-
     const rawBody = await req.text();
 
-    const isValid = await verifyPaystackSignature(rawBody, signature, secret);
+    const isValid = await verifyPaystackSignature(rawBody, signature, PAYSTACK_SECRET);
     if (!isValid) return json(401, { ok: false, message: "Invalid signature" });
 
     const payload = JSON.parse(rawBody);
@@ -46,10 +57,7 @@ serve(async (req) => {
 
     if (!event || !data) return json(400, { ok: false, message: "Invalid payload" });
 
-    const admin = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    const admin = createClient(SB_URL, SB_SERVICE);
 
     // ─────────────────────────────────────────────
     // 1) WITHDRAWAL WEBHOOK EVENTS
@@ -64,45 +72,51 @@ serve(async (req) => {
         .eq("reference", reference)
         .maybeSingle();
 
-      // If we don’t have it, still return OK (Paystack retries otherwise)
       if (wdErr) return json(500, { ok: false, message: wdErr.message });
       if (!wd) return json(200, { ok: true, message: "Withdrawal not found (ignored)" });
 
-      // Idempotency: if already final, ignore
       if (wd.status === "successful" || wd.status === "refunded" || wd.status === "failed") {
         return json(200, { ok: true, message: "Withdrawal already finalized" });
       }
 
       if (event === "transfer.success") {
-        await admin.from("withdrawals").update({ status: "successful" }).eq("reference", reference);
+        const { error } = await admin.from("withdrawals").update({ status: "successful" }).eq("reference", reference);
+        if (error) return json(500, { ok: false, message: error.message });
         return json(200, { ok: true });
       }
 
       // Failed or reversed => refund from clearing back to user
-      const { data: userAccount } = await admin
+      const { data: userAccount, error: uaErr } = await admin
         .from("ledger_accounts")
         .select("id")
         .eq("owner_type", "user")
         .eq("owner_id", wd.user_id)
         .eq("currency", "NGN")
+        .eq("account_type", "wallet")
         .single();
 
-      const { data: clearingAccount } = await admin
+      const { data: clearingAccount, error: caErr } = await admin
         .from("ledger_accounts")
         .select("id")
         .eq("owner_type", "system")
         .eq("account_type", "withdrawal_clearing")
         .single();
 
-      if (userAccount && clearingAccount) {
-        await admin.rpc("post_transfer", {
-          p_from_account: clearingAccount.id,
-          p_to_account: userAccount.id,
-          p_amount: Number(wd.amount),
-          p_reference: `${reference}-REFUND`,
-          p_metadata: { reason: event },
-        });
+      if (uaErr || caErr) {
+        // still finalize withdrawal state so Paystack doesn't retry forever
+        await admin.from("withdrawals").update({ status: "refunded" }).eq("reference", reference);
+        return json(200, { ok: true, message: "Refund accounts missing; marked refunded" });
       }
+
+      const { error: rpcErr } = await admin.rpc("post_transfer", {
+        p_from_account: clearingAccount.id,
+        p_to_account: userAccount.id,
+        p_amount: Number(wd.amount),
+        p_reference: `${reference}-REFUND`,
+        p_metadata: { reason: event },
+      });
+
+      if (rpcErr) return json(500, { ok: false, message: rpcErr.message });
 
       await admin.from("withdrawals").update({ status: "refunded" }).eq("reference", reference);
       return json(200, { ok: true });
@@ -119,7 +133,6 @@ serve(async (req) => {
         return json(400, { ok: false, message: "Missing reference/amount" });
       }
 
-      // Idempotency: do we already have this Paystack reference?
       const { data: existingTx, error: existErr } = await admin
         .from("paystack_transactions")
         .select("id")
@@ -129,8 +142,6 @@ serve(async (req) => {
       if (existErr) return json(500, { ok: false, message: existErr.message });
       if (existingTx) return json(200, { ok: true, message: "Already processed" });
 
-      // BEST: resolve user by the dedicated virtual account number
-      // Paystack usually provides authorization/account info in charge.success
       const authorization = data?.authorization ?? {};
       const possibleAccountNumber =
         authorization?.receiver_bank_account_number ||
@@ -151,22 +162,16 @@ serve(async (req) => {
         userId = va?.user_id ?? null;
       }
 
-      // Fallback: email matching
       if (!userId) {
         const email = data?.customer?.email as string | undefined;
         if (email) {
-          const { data: profile } = await admin
-            .from("profiles")
-            .select("id")
-            .eq("email", email)
-            .maybeSingle();
+          const { data: profile } = await admin.from("profiles").select("id").eq("email", email).maybeSingle();
           userId = profile?.id ?? null;
         }
       }
 
       if (!userId) return json(404, { ok: false, message: "User not found for this payment" });
 
-      // Credit wallet via your RPC (idempotency handled by unique reference + DB logic)
       const { error: creditErr } = await admin.rpc("credit_user_from_paystack", {
         p_user_id: userId,
         p_amount: amount,
@@ -176,8 +181,7 @@ serve(async (req) => {
 
       if (creditErr) return json(500, { ok: false, message: creditErr.message });
 
-      // Store Paystack tx record
-      await admin.from("paystack_transactions").insert({
+      const { error: insErr } = await admin.from("paystack_transactions").insert({
         reference,
         user_id: userId,
         amount,
@@ -185,13 +189,15 @@ serve(async (req) => {
         raw: data,
       });
 
+      if (insErr) return json(500, { ok: false, message: insErr.message });
+
       return json(200, { ok: true });
     }
 
-    // Anything else
     return json(200, { ok: true, ignored: true, event });
   } catch (err) {
     console.error("Webhook error:", err);
     return json(500, { ok: false, message: "Server error" });
   }
 });
+

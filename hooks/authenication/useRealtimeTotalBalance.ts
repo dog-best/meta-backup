@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
-import { supabase } from "../supabase/client";
+import { supabase } from "@/supabase/client";
+
+
 
 export function useRealtimeTotalBalance() {
   const [balance, setBalance] = useState<number>(0);

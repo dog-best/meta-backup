@@ -1,48 +1,71 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
+
+function json(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 serve(async (req) => {
   try {
+    const SB_URL = Deno.env.get("SB_URL");
+    const SB_SERVICE = Deno.env.get("SB_SERVICE_ROLE_KEY");
+
+    if (!SB_URL || !SB_SERVICE) {
+      return json(500, {
+        ok: false,
+        message: "Missing env vars",
+        hasSB_URL: !!SB_URL,
+        hasSB_SERVICE_ROLE_KEY: !!SB_SERVICE,
+      });
+    }
+
     const payload = await req.json();
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    const admin = createClient(SB_URL, SB_SERVICE);
 
-    // Alchemy sends an array of activities
     const activities = payload?.event?.activity;
     if (!Array.isArray(activities)) {
-      return new Response("No activity", { status: 200 });
+      return json(200, { ok: true, message: "No activity" });
     }
 
     for (const activity of activities) {
       const toAddress = activity.toAddress?.toLowerCase();
       if (!toAddress) continue;
 
-      // Check if this address belongs to one of our users
-      const { data: wallet } = await supabase
+      // wallet lookup
+      const { data: wallet, error: walletErr } = await admin
         .from("crypto_wallets")
         .select("id, user_id, chain")
         .eq("address", toAddress)
         .eq("chain", "ethereum")
-        .single();
+        .maybeSingle();
 
+      if (walletErr) {
+        console.error("wallet lookup error:", walletErr);
+        continue;
+      }
       if (!wallet) continue;
 
-      // Idempotency: skip if tx already exists
-      const { data: existing } = await supabase
+      // idempotency
+      const { data: existing, error: existErr } = await admin
         .from("crypto_deposits")
         .select("id")
         .eq("tx_hash", activity.hash)
         .eq("chain", "ethereum")
-        .single();
+        .maybeSingle();
 
+      if (existErr) {
+        console.error("deposit check error:", existErr);
+        continue;
+      }
       if (existing) continue;
 
       const amountEth = Number(activity.value) / 1e18;
 
-      await supabase.from("crypto_deposits").insert({
+      const { error: insErr } = await admin.from("crypto_deposits").insert({
         user_id: wallet.user_id,
         wallet_id: wallet.id,
         asset_symbol: "ETH",
@@ -53,11 +76,15 @@ serve(async (req) => {
         status: "pending",
         raw_tx: activity,
       });
+
+      if (insErr) {
+        console.error("deposit insert error:", insErr);
+      }
     }
 
-    return new Response("ok", { status: 200 });
+    return json(200, { ok: true });
   } catch (err) {
-    console.error("Webhook error:", err);
-    return new Response("error", { status: 500 });
+    console.error("alchemy-webhook error:", err);
+    return json(500, { ok: false, message: "Server error" });
   }
 });
