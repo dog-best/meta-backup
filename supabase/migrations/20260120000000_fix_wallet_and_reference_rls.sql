@@ -95,13 +95,14 @@ to anon, authenticated
 using (active = true);
 
 -- Bill providers/products (if used directly)
-alter table if exists public.bill_providers enable row level security;
 drop policy if exists bill_providers_select on public.bill_providers;
+
 create policy bill_providers_select
 on public.bill_providers
 for select
 to anon, authenticated
-using (active = true);
+using (true);
+
 
 alter table if exists public.bill_products enable row level security;
 drop policy if exists bill_products_select on public.bill_products;
